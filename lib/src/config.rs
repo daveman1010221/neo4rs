@@ -1,4 +1,4 @@
-use crate::auth::{ClientCertificate, ConnectionTLSConfig, MutualTLS};
+use crate::auth::{ClientCertificate, ConnectionTLSConfig, MutualTLS, RustlsConfig};
 use crate::errors::{Error, Result};
 #[cfg(feature = "unstable-bolt-protocol-impl-v2")]
 use serde::{Deserialize, Deserializer, Serialize};
@@ -171,6 +171,14 @@ impl ConfigBuilder {
         self
     }
 
+    /// A rustls client configuration of the caller's own, used as it is: its roots, its client certificate and key
+    /// (or a signer that holds the key elsewhere), its protocol versions. Under the `+ssc` schemes it is used as it is
+    /// too, since it already says how the server is verified; plain `bolt` and `neo4j` use no TLS, as with any other.
+    pub fn with_rustls_config(mut self, config: Arc<rustls::ClientConfig>) -> Self {
+        self.tls_config = ConnectionTLSConfig::Rustls(RustlsConfig(config));
+        self
+    }
+
     /// Skip SSL validation. This is not recommended for production use.
     /// This is true by default when connecting to the server using `neo4j+ssc` or 'bolt+ssc' schemes.
     pub fn skip_ssl_validation(mut self) -> Self {
@@ -266,6 +274,40 @@ mod tests {
         assert_eq!(config.fetch_size, 200);
         assert_eq!(config.max_connections, 16);
         assert_eq!(config.tls_config, ConnectionTLSConfig::NoSSLValidation);
+    }
+
+    fn a_rustls_config() -> Arc<rustls::ClientConfig> {
+        let roots = rustls::RootCertStore::empty();
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        )
+    }
+
+    #[test]
+    fn should_build_with_a_rustls_config_and_keep_that_very_one() {
+        let given = a_rustls_config();
+        let config = ConfigBuilder::default()
+            .uri("127.0.0.1:7687")
+            .user("some_user")
+            .password("some_password")
+            .with_rustls_config(given.clone())
+            .build()
+            .unwrap();
+        assert_eq!(
+            config.tls_config,
+            ConnectionTLSConfig::Rustls(RustlsConfig(given))
+        );
+        assert_ne!(
+            config.tls_config,
+            ConnectionTLSConfig::Rustls(RustlsConfig(a_rustls_config())),
+            "another configuration, however alike, is not this one"
+        );
     }
 
     #[test]
