@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum ConnectionTLSConfig {
@@ -6,6 +7,19 @@ pub enum ConnectionTLSConfig {
     ClientCACertificate(ClientCertificate),
     NoSSLValidation,
     MutualTLS(MutualTLS),
+    /// A rustls configuration the caller made, used as it is.
+    Rustls(RustlsConfig),
+}
+
+/// A rustls client configuration the caller made: its roots, its client certificate and key, or a signer that holds
+/// the key elsewhere, and its protocol versions. Two are equal when they are the same configuration.
+#[derive(Debug, Clone)]
+pub struct RustlsConfig(pub(crate) Arc<rustls::ClientConfig>);
+
+impl PartialEq for RustlsConfig {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -439,12 +439,7 @@ impl ConnectionInfo {
             .then(|| {
                 // do not apply validation if using a self-signed certificate,as the documentation suggests
                 let config = if !validation {
-                    match tls_config {
-                        ConnectionTLSConfig::MutualTLS(mtls) => {
-                            ConnectionTLSConfig::MutualTLS(mtls.with_no_validation())
-                        }
-                        _ => ConnectionTLSConfig::NoSSLValidation,
-                    }
+                    unvalidated(tls_config)
                 } else {
                     tls_config.clone()
                 };
@@ -492,81 +487,7 @@ impl ConnectionInfo {
         host: Host<&str>,
         tls_config: &ConnectionTLSConfig,
     ) -> Result<(TlsConnector, ServerName<'static>)> {
-        let mut root_cert_store = RootCertStore::empty();
-
-        let builder = ClientConfig::builder();
-        let config = match tls_config {
-            ConnectionTLSConfig::None => {
-                let native_certs = rustls_native_certs::load_native_certs();
-                if !native_certs.errors.is_empty() {
-                    warn!(
-                        "Failed to load native certificates: {:?}",
-                        native_certs.errors
-                    );
-                }
-                root_cert_store.add_parsable_certificates(native_certs.certs);
-                builder
-                    .with_root_certificates(root_cert_store)
-                    .with_no_client_auth()
-            }
-            ConnectionTLSConfig::ClientCACertificate(certificate) => {
-                let cert_file = File::open(&certificate.cert_file)?;
-                let reader = BufReader::new(cert_file);
-                let certs = CertificateDer::pem_reader_iter(reader).flatten();
-                root_cert_store.add_parsable_certificates(certs);
-                builder
-                    .with_root_certificates(root_cert_store)
-                    .with_no_client_auth()
-            }
-            ConnectionTLSConfig::NoSSLValidation => builder
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-                .with_no_client_auth(),
-            ConnectionTLSConfig::MutualTLS(mutual) => {
-                let cert_file = File::open(&mutual.client_cert)?;
-                let cert_reader = BufReader::new(cert_file);
-                let cert_certs = CertificateDer::pem_reader_iter(cert_reader).flatten();
-
-                let cert_key = File::open(&mutual.client_key)?;
-                let key_reader = BufReader::new(cert_key);
-                let keys = PrivateKeyDer::pem_reader_iter(key_reader)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(std::io::Error::other);
-                let keys = keys?.pop().unwrap();
-                if mutual.cert_file.is_some() {
-                    let root_cert_file = File::open(mutual.cert_file.as_ref().unwrap())?;
-                    let root_reader = BufReader::new(root_cert_file);
-                    let root_certs = CertificateDer::pem_reader_iter(root_reader).flatten();
-                    root_cert_store.add_parsable_certificates(root_certs);
-                    builder
-                        .with_root_certificates(root_cert_store)
-                        .with_client_auth_cert(cert_certs.collect(), keys)
-                        .map_err(|_e| Error::ConnectionError)?
-                } else if mutual.validation {
-                    let native_certs = rustls_native_certs::load_native_certs();
-                    if !native_certs.errors.is_empty() {
-                        warn!(
-                            "Failed to load native certificates: {:?}",
-                            native_certs.errors
-                        );
-                    }
-                    root_cert_store.add_parsable_certificates(native_certs.certs);
-                    builder
-                        .with_root_certificates(root_cert_store)
-                        .with_client_auth_cert(cert_certs.collect(), keys)
-                        .map_err(|_e| Error::ConnectionError)?
-                } else {
-                    builder
-                        .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-                        .with_client_auth_cert(cert_certs.collect(), keys)
-                        .map_err(|_e| Error::ConnectionError)?
-                }
-            }
-        };
-
-        let config = Arc::new(config);
-        let connector = TlsConnector::from(config);
+        let connector = TlsConnector::from(client_config(tls_config)?);
 
         let domain = match host {
             Host::Domain(domain) => ServerName::try_from(domain.to_owned())
@@ -577,6 +498,98 @@ impl ConnectionInfo {
 
         Ok((connector, domain))
     }
+}
+
+/// What the `+ssc` schemes do to a TLS configuration, the server's certificate not to be validated: a rustls
+/// configuration of the caller's is kept, since it says how the server is verified.
+fn unvalidated(tls_config: &ConnectionTLSConfig) -> ConnectionTLSConfig {
+    match tls_config {
+        ConnectionTLSConfig::MutualTLS(mtls) => {
+            ConnectionTLSConfig::MutualTLS(mtls.with_no_validation())
+        }
+        ConnectionTLSConfig::Rustls(given) => ConnectionTLSConfig::Rustls(given.clone()),
+        _ => ConnectionTLSConfig::NoSSLValidation,
+    }
+}
+
+/// The rustls configuration a connection uses for `tls_config`: the caller's own, as given, or one made from the
+/// files it names.
+fn client_config(tls_config: &ConnectionTLSConfig) -> Result<Arc<ClientConfig>> {
+    let mut root_cert_store = RootCertStore::empty();
+
+    let builder = ClientConfig::builder();
+    let config = match tls_config {
+        ConnectionTLSConfig::Rustls(given) => return Ok(given.0.clone()),
+        ConnectionTLSConfig::None => {
+            let native_certs = rustls_native_certs::load_native_certs();
+            if !native_certs.errors.is_empty() {
+                warn!(
+                    "Failed to load native certificates: {:?}",
+                    native_certs.errors
+                );
+            }
+            root_cert_store.add_parsable_certificates(native_certs.certs);
+            builder
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth()
+        }
+        ConnectionTLSConfig::ClientCACertificate(certificate) => {
+            let cert_file = File::open(&certificate.cert_file)?;
+            let reader = BufReader::new(cert_file);
+            let certs = CertificateDer::pem_reader_iter(reader).flatten();
+            root_cert_store.add_parsable_certificates(certs);
+            builder
+                .with_root_certificates(root_cert_store)
+                .with_no_client_auth()
+        }
+        ConnectionTLSConfig::NoSSLValidation => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+            .with_no_client_auth(),
+        ConnectionTLSConfig::MutualTLS(mutual) => {
+            let cert_file = File::open(&mutual.client_cert)?;
+            let cert_reader = BufReader::new(cert_file);
+            let cert_certs = CertificateDer::pem_reader_iter(cert_reader).flatten();
+
+            let cert_key = File::open(&mutual.client_key)?;
+            let key_reader = BufReader::new(cert_key);
+            let keys = PrivateKeyDer::pem_reader_iter(key_reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(std::io::Error::other);
+            let keys = keys?.pop().unwrap();
+            if mutual.cert_file.is_some() {
+                let root_cert_file = File::open(mutual.cert_file.as_ref().unwrap())?;
+                let root_reader = BufReader::new(root_cert_file);
+                let root_certs = CertificateDer::pem_reader_iter(root_reader).flatten();
+                root_cert_store.add_parsable_certificates(root_certs);
+                builder
+                    .with_root_certificates(root_cert_store)
+                    .with_client_auth_cert(cert_certs.collect(), keys)
+                    .map_err(|_e| Error::ConnectionError)?
+            } else if mutual.validation {
+                let native_certs = rustls_native_certs::load_native_certs();
+                if !native_certs.errors.is_empty() {
+                    warn!(
+                        "Failed to load native certificates: {:?}",
+                        native_certs.errors
+                    );
+                }
+                root_cert_store.add_parsable_certificates(native_certs.certs);
+                builder
+                    .with_root_certificates(root_cert_store)
+                    .with_client_auth_cert(cert_certs.collect(), keys)
+                    .map_err(|_e| Error::ConnectionError)?
+            } else {
+                builder
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
+                    .with_client_auth_cert(cert_certs.collect(), keys)
+                    .map_err(|_e| Error::ConnectionError)?
+            }
+        }
+    };
+
+    Ok(Arc::new(config))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -793,7 +806,69 @@ impl ServerCertVerifier for NoCertificateVerification {
 mod tests {
     use url::Host;
 
-    use super::NeoUrl;
+    use super::{client_config, unvalidated, ConnectionInfo, NeoUrl};
+    use crate::auth::{ConnectionTLSConfig, RustlsConfig};
+    use std::sync::Arc;
+
+    fn a_rustls_config() -> Arc<rustls::ClientConfig> {
+        Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth(),
+        )
+    }
+
+    #[test]
+    fn a_rustls_config_is_the_one_a_connection_uses() {
+        let given = a_rustls_config();
+        let used =
+            client_config(&ConnectionTLSConfig::Rustls(RustlsConfig(given.clone()))).unwrap();
+        assert!(Arc::ptr_eq(&used, &given));
+    }
+
+    #[test]
+    fn under_a_self_signed_scheme_a_rustls_config_is_kept_and_the_others_are_as_before() {
+        let given = a_rustls_config();
+        let rustls = ConnectionTLSConfig::Rustls(RustlsConfig(given.clone()));
+        assert_eq!(unvalidated(&rustls), rustls);
+        assert_eq!(
+            unvalidated(&ConnectionTLSConfig::None),
+            ConnectionTLSConfig::NoSSLValidation
+        );
+    }
+
+    #[test]
+    fn a_rustls_config_encrypts_the_encrypted_schemes_and_not_plain_bolt() {
+        let rustls = ConnectionTLSConfig::Rustls(RustlsConfig(a_rustls_config()));
+        for scheme in ["bolt+s", "bolt+ssc", "neo4j+s", "neo4j+ssc"] {
+            let info = ConnectionInfo::new(
+                &format!("{scheme}://localhost:7687"),
+                "u",
+                "p",
+                &rustls,
+                std::time::Duration::from_secs(1),
+                None,
+            )
+            .unwrap();
+            assert!(info.prepare.encryption.is_some(), "{scheme}");
+        }
+        for scheme in ["bolt", "neo4j"] {
+            let info = ConnectionInfo::new(
+                &format!("{scheme}://localhost:7687"),
+                "u",
+                "p",
+                &rustls,
+                std::time::Duration::from_secs(1),
+                None,
+            )
+            .unwrap();
+            assert!(info.prepare.encryption.is_none(), "{scheme}");
+        }
+    }
 
     #[test]
     fn should_parse_uri() {
